@@ -1,0 +1,459 @@
+import re
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537.36"
+    ),
+    "Referer": "https://db.netkeiba.com/",
+}
+
+BASE_HORSE_URL = "https://db.netkeiba.com/horse/"
+
+PED_AJAX_URL = "https://db.netkeiba.com/horse/ajax_horse_pedigree.html"
+RESULTS_AJAX_URL = "https://db.netkeiba.com/horse/ajax_horse_results.html"
+
+
+def build_horse_url(hrno: str) -> str:
+    return f"{BASE_HORSE_URL}{str(hrno).strip()}/"
+
+
+def _clean_td_value(td) -> str | None:
+    if td is None:
+        return None
+    v = td.get_text(" ", strip=True)
+    if v == "":
+        return None
+    if v == "-":
+        return "-"
+    return v
+
+
+def _extract_no(pattern: str, text: str) -> str | None:
+    if not text:
+        return None
+    m = re.search(pattern, text)
+    return m.group(1) if m else None
+
+
+def _extract_html_from_ajax_json(data: dict) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    for k in ["html", "data", "result", "body", "content"]:
+        v = data.get(k)
+        if isinstance(v, str) and "<" in v:
+            return v
+    return None
+
+
+def _parse_jp_money(text: str | None) -> str | None:
+    """
+    억(億)과 만(万)이 포함된 일본 금액 텍스트를 파싱하여
+    '만엔' 단위의 정수형 문자열로 반환.
+    예:
+      "2億7,958万円" -> "27958"
+      "2億 958万円" -> "20958"
+      "5,076万円 (2016年...)" -> "5076"
+      "-" -> "-"
+    """
+    if not text:
+        return None
+
+    t = text.strip()
+    if t == "-":
+        return "-"
+
+    # 콤마 및 띄어쓰기 완전 제거
+    t = t.replace(",", "").replace(" ", "")
+
+    oku_val = 0
+    man_val = 0
+
+    # 1) 억(億) 추출
+    m_oku = re.search(r"(\d+)億", t)
+    if m_oku:
+        oku_val = int(m_oku.group(1))
+
+    # 2) 만(万) 추출 (억 뒤부터 만 앞까지, 혹은 처음부터 만 앞까지)
+    # "2億958万" 에서 958 추출, "5076万" 에서 5076 추출
+    if "億" in t:
+        m_man = re.search(r"億(\d+)万", t)
+    else:
+        m_man = re.search(r"(\d+)万", t)
+
+    if m_man:
+        man_val = int(m_man.group(1))
+
+    # 만 단위가 없고 억만 있는 경우 예외 처리 (예: "2億円")
+    if oku_val > 0 and man_val == 0 and "万" not in t:
+        pass
+
+    # 만약 '억'이나 '만' 글자가 아예 없고 숫자만 있는 경우 방어 코드 (예: "12340000円")
+    if oku_val == 0 and man_val == 0 and "万" not in t and "億" not in t:
+        m_pure = re.search(r"(\d+)", t)
+        if m_pure:
+            # 순수 숫자의 경우 원단위(엔)일 가능성이 높으므로 그대로 추출할지, 만으로 나눌지 정책 결정 필요
+            # 기존 코드는 그대로 반환했으므로 동일하게 처리
+            return m_pure.group(1)
+
+    total_man = (oku_val * 10000) + man_val
+    return str(total_man)
+
+
+# -------------------------------
+# 혈통 AJAX
+# -------------------------------
+def fetch_pedigree_fa_mo(hr_no: str, session: requests.Session) -> dict:
+    result = {
+        "FA_HR_NAME": None,
+        "FA_HR_NO": None,
+        "MO_HR_NAME": None,
+        "MO_HR_NO": None,
+    }
+
+    if not hr_no:
+        return result
+
+    params = {
+        "input": "UTF-8",
+        "output": "json",
+        "id": hr_no,
+    }
+
+    res = session.get(PED_AJAX_URL, params=params, headers=HEADERS, timeout=20)
+    res.encoding = res.apparent_encoding
+
+    try:
+        data = res.json()
+    except Exception:
+        return result
+
+    html = _extract_html_from_ajax_json(data)
+    if not html:
+        return result
+
+    soup = BeautifulSoup(html, "lxml")
+
+    fa_a = soup.select_one(".b_ml a")
+    if fa_a:
+        result["FA_HR_NAME"] = fa_a.get("title") or fa_a.get_text(" ", strip=True)
+        href = fa_a.get("href", "")
+        result["FA_HR_NO"] = _extract_no(r"/ped/([^/]+)/?", href)
+
+    mo_candidates = []
+    for td in soup.select("td.b_fml"):
+        a = td.find("a")
+        if not a:
+            continue
+
+        href = a.get("href", "")
+        ped_no = _extract_no(r"/ped/([^/]+)/?", href)
+        ped_name = a.get("title") or a.get_text(" ", strip=True)
+
+        rowspan_raw = td.get("rowspan")
+        try:
+            rowspan = int(rowspan_raw) if rowspan_raw else 1
+        except ValueError:
+            rowspan = 1
+
+        mo_candidates.append((rowspan, ped_name, ped_no))
+
+    if mo_candidates:
+        mo_candidates.sort(key=lambda x: x[0], reverse=True)
+        _, mo_name, mo_no = mo_candidates[0]
+        result["MO_HR_NAME"] = mo_name
+        result["MO_HR_NO"] = mo_no
+
+    return result
+
+
+# -------------------------------
+# 날짜 파싱
+# -------------------------------
+def _parse_jp_date(date_text: str) -> datetime | None:
+    if not date_text:
+        return None
+
+    t = date_text.strip()
+    try:
+        return datetime.strptime(t, "%Y/%m/%d")
+    except Exception:
+        pass
+
+    try:
+        return datetime.strptime(t, "%Y.%m.%d")
+    except Exception:
+        pass
+
+    m = re.match(r"^\s*(\d{4})\D+(\d{1,2})\D+(\d{1,2})\s*$", t)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return datetime(y, mo, d)
+        except Exception:
+            return None
+    return None
+
+
+def _parse_prize_to_int(text: str | None) -> int:
+    if not text:
+        return 0
+
+    t = text.strip()
+    if t == "-" or t == "":
+        return 0
+
+    t = t.replace(",", "")
+
+    m_man = re.search(r"(\d+(?:\.\d+)?)\s*万", t)
+    if m_man:
+        try:
+            return int(float(m_man.group(1)) * 10000)
+        except Exception:
+            return 0
+
+    m = re.search(r"(\d+)", t)
+    if not m:
+        return 0
+    try:
+        return int(m.group(1))
+    except Exception:
+        return 0
+
+
+# -------------------------------
+# 출주기록 집계
+# -------------------------------
+def fetch_results_counts(hr_no: str, session: requests.Session) -> dict:
+    result = {
+        "RC_CNTT": 0, "ORD1_CNTT": 0, "ORD2_CNTT": 0, "ORD3_CNTT": 0,
+        "RC_CNTY": 0, "ORD1_CNTY": 0, "ORD2_CNTY": 0, "ORD3_CNTY": 0,
+        "CHAKSUNY": 0, "CHAKSUN_6M": 0,
+    }
+
+    if not hr_no:
+        return result
+
+    params = {"input": "UTF-8", "output": "json", "id": hr_no}
+    res = session.get(RESULTS_AJAX_URL, params=params, headers=HEADERS, timeout=20)
+    res.encoding = res.apparent_encoding
+
+    try:
+        data = res.json()
+    except Exception:
+        return result
+
+    html = _extract_html_from_ajax_json(data)
+    if not html:
+        return result
+
+    soup = BeautifulSoup(html, "lxml")
+
+    target_table = None
+    for t in soup.find_all("table"):
+        if "着順" in t.get_text(" ", strip=True):
+            target_table = t
+            break
+    if target_table is None:
+        target_table = soup.find("table")
+    if target_table is None:
+        return result
+
+    rows = target_table.select("tr")
+    if len(rows) <= 1:
+        return result
+
+    header_tr = rows[0]
+    header_cells = header_tr.find_all(["th", "td"])
+    header_texts = [c.get_text(" ", strip=True) for c in header_cells]
+
+    def find_col_idx(keyword: str) -> int | None:
+        for i, h in enumerate(header_texts):
+            if keyword in h:
+                return i
+        return None
+
+    DATE_COL_IDX = find_col_idx("日付")
+    PRIZE_COL_IDX = find_col_idx("賞金")
+    FINISH_COL_IDX = find_col_idx("着順")
+
+    if FINISH_COL_IDX is None:
+        FINISH_COL_IDX = 11
+
+    data_rows = []
+    for tr in rows[1:]:
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        data_rows.append(tds)
+
+    result["RC_CNTT"] = len(data_rows)
+    today = datetime.today()
+    cutoff_1y = today - timedelta(days=365)
+    cutoff_6m = today - timedelta(days=183)
+
+    for tds in data_rows:
+        if FINISH_COL_IDX is not None and len(tds) > FINISH_COL_IDX:
+            finish_text = tds[FINISH_COL_IDX].get_text(" ", strip=True)
+            m = re.match(r"^(\d+)", finish_text)
+            if m:
+                fin = int(m.group(1))
+                if fin == 1:
+                    result["ORD1_CNTT"] += 1
+                elif fin == 2:
+                    result["ORD2_CNTT"] += 1
+                elif fin == 3:
+                    result["ORD3_CNTT"] += 1
+
+        if DATE_COL_IDX is None or len(tds) <= DATE_COL_IDX:
+            continue
+
+        date_text = tds[DATE_COL_IDX].get_text(" ", strip=True)
+        dt = _parse_jp_date(date_text)
+        if dt is None:
+            continue
+        if dt > today:
+            continue
+
+        if dt >= cutoff_1y:
+            result["RC_CNTY"] += 1
+            if len(tds) > FINISH_COL_IDX:
+                finish_text = tds[FINISH_COL_IDX].get_text(" ", strip=True)
+                m = re.match(r"^(\d+)", finish_text)
+                if m:
+                    fin = int(m.group(1))
+                    if fin == 1:
+                        result["ORD1_CNTY"] += 1
+                    elif fin == 2:
+                        result["ORD2_CNTY"] += 1
+                    elif fin == 3:
+                        result["ORD3_CNTY"] += 1
+
+            if PRIZE_COL_IDX is not None and len(tds) > PRIZE_COL_IDX:
+                prize_text = tds[PRIZE_COL_IDX].get_text(" ", strip=True)
+                result["CHAKSUNY"] += _parse_prize_to_int(prize_text)
+
+        if dt >= cutoff_6m:
+            if PRIZE_COL_IDX is not None and len(tds) > PRIZE_COL_IDX:
+                prize_text = tds[PRIZE_COL_IDX].get_text(" ", strip=True)
+                result["CHAKSUN_6M"] += _parse_prize_to_int(prize_text)
+
+    return result
+
+
+# -------------------------------
+# 메인 파서
+# -------------------------------
+def parse_horse_page(url: str, session: requests.Session | None = None) -> dict:
+    m = re.search(r"/horse/(\d+)/?", url)
+    hr_no = m.group(1) if m else None
+
+    out = {
+        "HR_NO": hr_no,
+        "HR_NAME": None, "SEX": None, "AGE": None, "BIRTHDAY": None,
+        "TR_NAME": None, "TR_NO": None, "OW_NAME": None, "OW_NO": None,
+        "BREEDER": None, "BRED_REGION": None, "HR_LAST_AMT": None,
+        "CHAKSUNT_JRA": None, "CHAKSUNT_NAR": None, "CAREER_TOTAL": None,
+        "MAIN_WINS": None, "RELATED_HORSES": None,
+        "FA_HR_NAME": None, "FA_HR_NO": None, "MO_HR_NAME": None, "MO_HR_NO": None,
+        "RC_CNTT": None, "ORD1_CNTT": None, "ORD2_CNTT": None, "ORD3_CNTT": None,
+        "RC_CNTY": None, "ORD1_CNTY": None, "ORD2_CNTY": None, "ORD3_CNTY": None,
+        "CHAKSUNY": None, "CHAKSUN_6M": None,
+    }
+
+    sess = session or requests.Session()
+    res = sess.get(url, headers=HEADERS, timeout=20)
+    res.encoding = res.apparent_encoding
+
+    soup = BeautifulSoup(res.text, "lxml")
+
+    title_tag = soup.select_one(".horse_title")
+    if title_tag:
+        out["HR_NAME"] = title_tag.get_text(" ", strip=True).split()[0]
+
+    txt01_tag = soup.select_one(".txt_01")
+    if txt01_tag:
+        txt = txt01_tag.get_text(" ", strip=True)
+        m2 = re.search(r"(牡|牝|セ)\s*(\d+)?", txt)
+        if m2:
+            out["SEX"] = m2.group(1)
+            out["AGE"] = m2.group(2)
+
+    prof_area = soup.select_one("div.db_prof_area_02")
+    if prof_area is None:
+        prof_area = soup.select_one("div.db_prof")
+
+    if prof_area:
+        prof_table = prof_area.find("table")
+        if prof_table:
+            rows = prof_table.select("tr")
+            for tr in rows:
+                th = tr.find("th")
+                td = tr.find("td")
+                if not th or not td:
+                    continue
+
+                key = th.get_text(" ", strip=True)
+                td_text = _clean_td_value(td)
+
+                if "生年月日" in key:
+                    out["BIRTHDAY"] = td_text
+                elif "調教師" in key:
+                    a = td.find("a")
+                    if a:
+                        out["TR_NAME"] = a.get("title") or _clean_td_value(a)
+                        href = a.get("href", "")
+                        out["TR_NO"] = _extract_no(r"/trainer/([^/]+)/?", href)
+                    else:
+                        out["TR_NAME"] = td_text
+                elif "馬主" in key:
+                    a = td.find("a")
+                    if a:
+                        out["OW_NAME"] = a.get("title") or _clean_td_value(a)
+                        href = a.get("href", "")
+                        out["OW_NO"] = _extract_no(r"/owner/([^/]+)/?", href)
+                    else:
+                        out["OW_NAME"] = td_text
+                elif "産地" in key:
+                    out["BRED_REGION"] = td_text
+                elif "生産者" in key:
+                    out["BREEDER"] = td_text
+                elif "獲得賞金 (中央)" in key:
+                    # ✅ 수정된 전용 함수 적용
+                    out["CHAKSUNT_JRA"] = _parse_jp_money(td_text)
+                elif ("獲得賞金 (地方)" in key) or ("獲得賞金(地方)" in key) or ("獲得賞金（地方）" in key):
+                    # ✅ 수정된 전용 함수 적용
+                    out["CHAKSUNT_NAR"] = _parse_jp_money(td_text)
+                elif "通算成績" in key:
+                    out["CAREER_TOTAL"] = td_text
+                elif "主な勝鞍" in key:
+                    out["MAIN_WINS"] = td_text
+                elif "近親馬" in key:
+                    out["RELATED_HORSES"] = td_text
+                elif "セリ取引価格" in key:
+                    # ✅ 수정된 전용 함수 적용
+                    out["HR_LAST_AMT"] = _parse_jp_money(td_text)
+
+    ped = fetch_pedigree_fa_mo(hr_no, sess)
+    out["FA_HR_NAME"] = ped["FA_HR_NAME"]
+    out["FA_HR_NO"] = ped["FA_HR_NO"]
+    out["MO_HR_NAME"] = ped["MO_HR_NAME"]
+    out["MO_HR_NO"] = ped["MO_HR_NO"]
+
+    counts = fetch_results_counts(hr_no, sess)
+    out["RC_CNTT"] = counts["RC_CNTT"]
+    out["ORD1_CNTT"] = counts["ORD1_CNTT"]
+    out["ORD2_CNTT"] = counts["ORD2_CNTT"]
+    out["ORD3_CNTT"] = counts["ORD3_CNTT"]
+    out["RC_CNTY"] = counts["RC_CNTY"]
+    out["ORD1_CNTY"] = counts["ORD1_CNTY"]
+    out["ORD2_CNTY"] = counts["ORD2_CNTY"]
+    out["ORD3_CNTY"] = counts["ORD3_CNTY"]
+    out["CHAKSUNY"] = counts["CHAKSUNY"]
+    out["CHAKSUN_6M"] = counts["CHAKSUN_6M"]
+
+    return out
