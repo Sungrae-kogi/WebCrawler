@@ -1,8 +1,13 @@
 import re
-import requests
+import asyncio
+import aiohttp
+import json
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 
+# ==========================================
+# 1. 상수 (Constants) 정의
+# ==========================================
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -13,36 +18,33 @@ HEADERS = {
 }
 
 BASE_HORSE_URL = "https://db.netkeiba.com/horse/"
-
 PED_AJAX_URL = "https://db.netkeiba.com/horse/ajax_horse_pedigree.html"
 RESULTS_AJAX_URL = "https://db.netkeiba.com/horse/ajax_horse_results.html"
 
 
+# ==========================================
+# 2. 내부 헬퍼 함수들 (동기식 그대로 사용)
+# ==========================================
 def build_horse_url(hrno: str) -> str:
     return f"{BASE_HORSE_URL}{str(hrno).strip()}/"
 
 
 def _clean_td_value(td) -> str | None:
-    if td is None:
-        return None
+    if td is None: return None
     v = td.get_text(" ", strip=True)
-    if v == "":
-        return None
-    if v == "-":
-        return "-"
+    if v == "": return None
+    if v == "-": return "-"
     return v
 
 
 def _extract_no(pattern: str, text: str) -> str | None:
-    if not text:
-        return None
+    if not text: return None
     m = re.search(pattern, text)
     return m.group(1) if m else None
 
 
 def _extract_html_from_ajax_json(data: dict) -> str | None:
-    if not isinstance(data, dict):
-        return None
+    if not isinstance(data, dict): return None
     for k in ["html", "data", "result", "body", "content"]:
         v = data.get(k)
         if isinstance(v, str) and "<" in v:
@@ -51,133 +53,35 @@ def _extract_html_from_ajax_json(data: dict) -> str | None:
 
 
 def _parse_jp_money(text: str | None) -> str | None:
-    """
-    억(億)과 만(万)이 포함된 일본 금액 텍스트를 파싱하여
-    '만엔' 단위의 정수형 문자열로 반환.
-    예:
-      "2億7,958万円" -> "27958"
-      "2億 958万円" -> "20958"
-      "5,076万円 (2016年...)" -> "5076"
-      "-" -> "-"
-    """
-    if not text:
-        return None
-
+    if not text: return None
     t = text.strip()
-    if t == "-":
-        return "-"
+    if t == "-": return "-"
 
-    # 콤마 및 띄어쓰기 완전 제거
     t = t.replace(",", "").replace(" ", "")
-
     oku_val = 0
     man_val = 0
 
-    # 1) 억(億) 추출
     m_oku = re.search(r"(\d+)億", t)
-    if m_oku:
-        oku_val = int(m_oku.group(1))
+    if m_oku: oku_val = int(m_oku.group(1))
 
-    # 2) 만(万) 추출 (억 뒤부터 만 앞까지, 혹은 처음부터 만 앞까지)
-    # "2億958万" 에서 958 추출, "5076万" 에서 5076 추출
     if "億" in t:
         m_man = re.search(r"億(\d+)万", t)
     else:
         m_man = re.search(r"(\d+)万", t)
 
-    if m_man:
-        man_val = int(m_man.group(1))
+    if m_man: man_val = int(m_man.group(1))
 
-    # 만 단위가 없고 억만 있는 경우 예외 처리 (예: "2億円")
-    if oku_val > 0 and man_val == 0 and "万" not in t:
-        pass
-
-    # 만약 '억'이나 '만' 글자가 아예 없고 숫자만 있는 경우 방어 코드 (예: "12340000円")
+    if oku_val > 0 and man_val == 0 and "万" not in t: pass
     if oku_val == 0 and man_val == 0 and "万" not in t and "億" not in t:
         m_pure = re.search(r"(\d+)", t)
-        if m_pure:
-            # 순수 숫자의 경우 원단위(엔)일 가능성이 높으므로 그대로 추출할지, 만으로 나눌지 정책 결정 필요
-            # 기존 코드는 그대로 반환했으므로 동일하게 처리
-            return m_pure.group(1)
+        if m_pure: return m_pure.group(1)
 
     total_man = (oku_val * 10000) + man_val
     return str(total_man)
 
 
-# -------------------------------
-# 혈통 AJAX
-# -------------------------------
-def fetch_pedigree_fa_mo(hr_no: str, session: requests.Session) -> dict:
-    result = {
-        "FA_HR_NAME": None,
-        "FA_HR_NO": None,
-        "MO_HR_NAME": None,
-        "MO_HR_NO": None,
-    }
-
-    if not hr_no:
-        return result
-
-    params = {
-        "input": "UTF-8",
-        "output": "json",
-        "id": hr_no,
-    }
-
-    res = session.get(PED_AJAX_URL, params=params, headers=HEADERS, timeout=20)
-    res.encoding = res.apparent_encoding
-
-    try:
-        data = res.json()
-    except Exception:
-        return result
-
-    html = _extract_html_from_ajax_json(data)
-    if not html:
-        return result
-
-    soup = BeautifulSoup(html, "lxml")
-
-    fa_a = soup.select_one(".b_ml a")
-    if fa_a:
-        result["FA_HR_NAME"] = fa_a.get("title") or fa_a.get_text(" ", strip=True)
-        href = fa_a.get("href", "")
-        result["FA_HR_NO"] = _extract_no(r"/ped/([^/]+)/?", href)
-
-    mo_candidates = []
-    for td in soup.select("td.b_fml"):
-        a = td.find("a")
-        if not a:
-            continue
-
-        href = a.get("href", "")
-        ped_no = _extract_no(r"/ped/([^/]+)/?", href)
-        ped_name = a.get("title") or a.get_text(" ", strip=True)
-
-        rowspan_raw = td.get("rowspan")
-        try:
-            rowspan = int(rowspan_raw) if rowspan_raw else 1
-        except ValueError:
-            rowspan = 1
-
-        mo_candidates.append((rowspan, ped_name, ped_no))
-
-    if mo_candidates:
-        mo_candidates.sort(key=lambda x: x[0], reverse=True)
-        _, mo_name, mo_no = mo_candidates[0]
-        result["MO_HR_NAME"] = mo_name
-        result["MO_HR_NO"] = mo_no
-
-    return result
-
-
-# -------------------------------
-# 날짜 파싱
-# -------------------------------
 def _parse_jp_date(date_text: str) -> datetime | None:
-    if not date_text:
-        return None
-
+    if not date_text: return None
     t = date_text.strip()
     try:
         return datetime.strptime(t, "%Y/%m/%d")
@@ -200,13 +104,9 @@ def _parse_jp_date(date_text: str) -> datetime | None:
 
 
 def _parse_prize_to_int(text: str | None) -> int:
-    if not text:
-        return 0
-
+    if not text: return 0
     t = text.strip()
-    if t == "-" or t == "":
-        return 0
-
+    if t == "-" or t == "": return 0
     t = t.replace(",", "")
 
     m_man = re.search(r"(\d+(?:\.\d+)?)\s*万", t)
@@ -217,40 +117,108 @@ def _parse_prize_to_int(text: str | None) -> int:
             return 0
 
     m = re.search(r"(\d+)", t)
-    if not m:
-        return 0
+    if not m: return 0
     try:
         return int(m.group(1))
     except Exception:
         return 0
 
 
-# -------------------------------
-# 출주기록 집계
-# -------------------------------
-def fetch_results_counts(hr_no: str, session: requests.Session) -> dict:
+# ==========================================
+# 3. 비동기 통신 함수들 (AJAX 파싱)
+# ==========================================
+async def fetch_pedigree_fa_mo(
+        hr_no: str,
+        session: aiohttp.ClientSession
+) -> dict:
+    result = {
+        "FA_HR_NAME": None, "FA_HR_NO": None,
+        "MO_HR_NAME": None, "MO_HR_NO": None,
+    }
+    if not hr_no: return result
+    params = {"input": "UTF-8", "output": "json", "id": hr_no}
+
+    try:
+        async with session.get(
+                PED_AJAX_URL,
+                params=params,
+                headers=HEADERS,
+                timeout=20
+        ) as res:
+
+            raw_text = await res.text(
+                encoding="euc-jp",
+                errors="replace"
+            )
+            data = json.loads(raw_text)
+    except Exception as e:
+        print(f"[WARN] 혈통 AJAX 에러 HRNO={hr_no} / {e}")
+        return result
+
+    html = _extract_html_from_ajax_json(data)
+    if not html: return result
+    soup = BeautifulSoup(html, "lxml")
+
+    fa_a = soup.select_one(".b_ml a")
+    if fa_a:
+        result["FA_HR_NAME"] = fa_a.get("title") or fa_a.get_text(" ", strip=True)
+        href = fa_a.get("href", "")
+        result["FA_HR_NO"] = _extract_no(r"/ped/([^/]+)/?", href)
+
+    mo_candidates = []
+    for td in soup.select("td.b_fml"):
+        a = td.find("a")
+        if not a: continue
+        href = a.get("href", "")
+        ped_no = _extract_no(r"/ped/([^/]+)/?", href)
+        ped_name = a.get("title") or a.get_text(" ", strip=True)
+        rowspan_raw = td.get("rowspan")
+        try:
+            rowspan = int(rowspan_raw) if rowspan_raw else 1
+        except ValueError:
+            rowspan = 1
+        mo_candidates.append((rowspan, ped_name, ped_no))
+
+    if mo_candidates:
+        mo_candidates.sort(key=lambda x: x[0], reverse=True)
+        _, mo_name, mo_no = mo_candidates[0]
+        result["MO_HR_NAME"] = mo_name
+        result["MO_HR_NO"] = mo_no
+
+    return result
+
+
+async def fetch_results_counts(
+        hr_no: str,
+        session: aiohttp.ClientSession
+) -> dict:
     result = {
         "RC_CNTT": 0, "ORD1_CNTT": 0, "ORD2_CNTT": 0, "ORD3_CNTT": 0,
         "RC_CNTY": 0, "ORD1_CNTY": 0, "ORD2_CNTY": 0, "ORD3_CNTY": 0,
         "CHAKSUNY": 0, "CHAKSUN_6M": 0,
     }
-
-    if not hr_no:
-        return result
-
+    if not hr_no: return result
     params = {"input": "UTF-8", "output": "json", "id": hr_no}
-    res = session.get(RESULTS_AJAX_URL, params=params, headers=HEADERS, timeout=20)
-    res.encoding = res.apparent_encoding
 
     try:
-        data = res.json()
-    except Exception:
+        async with session.get(
+                RESULTS_AJAX_URL,
+                params=params,
+                headers=HEADERS,
+                timeout=20
+        ) as res:
+
+            raw_text = await res.text(
+                encoding="euc-jp",
+                errors="replace"
+            )
+            data = json.loads(raw_text)
+    except Exception as e:
+        print(f"[WARN] 성적 AJAX 에러 HRNO={hr_no} / {e}")
         return result
 
     html = _extract_html_from_ajax_json(data)
-    if not html:
-        return result
-
+    if not html: return result
     soup = BeautifulSoup(html, "lxml")
 
     target_table = None
@@ -258,14 +226,11 @@ def fetch_results_counts(hr_no: str, session: requests.Session) -> dict:
         if "着順" in t.get_text(" ", strip=True):
             target_table = t
             break
-    if target_table is None:
-        target_table = soup.find("table")
-    if target_table is None:
-        return result
+    if target_table is None: target_table = soup.find("table")
+    if target_table is None: return result
 
     rows = target_table.select("tr")
-    if len(rows) <= 1:
-        return result
+    if len(rows) <= 1: return result
 
     header_tr = rows[0]
     header_cells = header_tr.find_all(["th", "td"])
@@ -273,22 +238,18 @@ def fetch_results_counts(hr_no: str, session: requests.Session) -> dict:
 
     def find_col_idx(keyword: str) -> int | None:
         for i, h in enumerate(header_texts):
-            if keyword in h:
-                return i
+            if keyword in h: return i
         return None
 
     DATE_COL_IDX = find_col_idx("日付")
     PRIZE_COL_IDX = find_col_idx("賞金")
     FINISH_COL_IDX = find_col_idx("着順")
-
-    if FINISH_COL_IDX is None:
-        FINISH_COL_IDX = 11
+    if FINISH_COL_IDX is None: FINISH_COL_IDX = 11
 
     data_rows = []
     for tr in rows[1:]:
         tds = tr.find_all("td")
-        if not tds:
-            continue
+        if not tds: continue
         data_rows.append(tds)
 
     result["RC_CNTT"] = len(data_rows)
@@ -309,15 +270,11 @@ def fetch_results_counts(hr_no: str, session: requests.Session) -> dict:
                 elif fin == 3:
                     result["ORD3_CNTT"] += 1
 
-        if DATE_COL_IDX is None or len(tds) <= DATE_COL_IDX:
-            continue
+        if DATE_COL_IDX is None or len(tds) <= DATE_COL_IDX: continue
 
         date_text = tds[DATE_COL_IDX].get_text(" ", strip=True)
         dt = _parse_jp_date(date_text)
-        if dt is None:
-            continue
-        if dt > today:
-            continue
+        if dt is None or dt > today: continue
 
         if dt >= cutoff_1y:
             result["RC_CNTY"] += 1
@@ -345,13 +302,14 @@ def fetch_results_counts(hr_no: str, session: requests.Session) -> dict:
     return result
 
 
-# -------------------------------
-# 메인 파서
-# -------------------------------
-def parse_horse_page(url: str, session: requests.Session | None = None) -> dict:
-    m = re.search(r"/horse/(\d+)/?", url)
-    hr_no = m.group(1) if m else None
-
+# ==========================================
+# 4. 메인 파서 함수 (비동기)
+# ==========================================
+async def parse_horse_page(
+        url: str,
+        hr_no: str,
+        session: aiohttp.ClientSession
+) -> dict:
     out = {
         "HR_NO": hr_no,
         "HR_NAME": None, "SEX": None, "AGE": None, "BIRTHDAY": None,
@@ -365,11 +323,14 @@ def parse_horse_page(url: str, session: requests.Session | None = None) -> dict:
         "CHAKSUNY": None, "CHAKSUN_6M": None,
     }
 
-    sess = session or requests.Session()
-    res = sess.get(url, headers=HEADERS, timeout=20)
-    res.encoding = res.apparent_encoding
+# 인코딩 지정 및 에러 무시
+    async with session.get(url, headers=HEADERS, timeout=20) as res:
+        html = await res.text(
+            encoding="euc-jp",
+            errors="replace"
+        )
 
-    soup = BeautifulSoup(res.text, "lxml")
+    soup = BeautifulSoup(html, "lxml")
 
     title_tag = soup.select_one(".horse_title")
     if title_tag:
@@ -394,8 +355,7 @@ def parse_horse_page(url: str, session: requests.Session | None = None) -> dict:
             for tr in rows:
                 th = tr.find("th")
                 td = tr.find("td")
-                if not th or not td:
-                    continue
+                if not th or not td: continue
 
                 key = th.get_text(" ", strip=True)
                 td_text = _clean_td_value(td)
@@ -423,10 +383,8 @@ def parse_horse_page(url: str, session: requests.Session | None = None) -> dict:
                 elif "生産者" in key:
                     out["BREEDER"] = td_text
                 elif "獲得賞金 (中央)" in key:
-                    # ✅ 수정된 전용 함수 적용
                     out["CHAKSUNT_JRA"] = _parse_jp_money(td_text)
                 elif ("獲得賞金 (地方)" in key) or ("獲得賞金(地方)" in key) or ("獲得賞金（地方）" in key):
-                    # ✅ 수정된 전용 함수 적용
                     out["CHAKSUNT_NAR"] = _parse_jp_money(td_text)
                 elif "通算成績" in key:
                     out["CAREER_TOTAL"] = td_text
@@ -435,16 +393,21 @@ def parse_horse_page(url: str, session: requests.Session | None = None) -> dict:
                 elif "近親馬" in key:
                     out["RELATED_HORSES"] = td_text
                 elif "セリ取引価格" in key:
-                    # ✅ 수정된 전용 함수 적용
                     out["HR_LAST_AMT"] = _parse_jp_money(td_text)
 
-    ped = fetch_pedigree_fa_mo(hr_no, sess)
+    # 비동기로 혈통과 성적을 동시에 병렬 수집
+    # asyncio.gather는 여러 개의 비동기 작업(코루틴)을 동시에(병렬로) 실행하고, 그 결과들을 하나의 리스트로 모아주는 도구입니다.
+
+
+    ped_task = fetch_pedigree_fa_mo(hr_no, session)
+    counts_task = fetch_results_counts(hr_no, session)
+    ped, counts = await asyncio.gather(ped_task, counts_task)                   # asyncio.gather() 로 AJAX 요청 두개를 묶어서 처리.
+
     out["FA_HR_NAME"] = ped["FA_HR_NAME"]
     out["FA_HR_NO"] = ped["FA_HR_NO"]
     out["MO_HR_NAME"] = ped["MO_HR_NAME"]
     out["MO_HR_NO"] = ped["MO_HR_NO"]
 
-    counts = fetch_results_counts(hr_no, sess)
     out["RC_CNTT"] = counts["RC_CNTT"]
     out["ORD1_CNTT"] = counts["ORD1_CNTT"]
     out["ORD2_CNTT"] = counts["ORD2_CNTT"]

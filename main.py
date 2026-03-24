@@ -1,105 +1,167 @@
 # main.py
 import csv
-import time
 import random
+import asyncio
+import aiohttp
 from pathlib import Path
-import requests
+
+
+
+# 파서 함수들도 비동기(async)로 바뀌어야 하므로
+# 이름 앞에 await를 붙여서 호출할 예정입니다.
 from parser import build_horse_url, parse_horse_page
 
 
-def load_hrno_list_from_csv(csv_path: Path, col_name: str = "HRNO") -> list[str]:
-    """data/unique_hrno.csv에서 HRNO 컬럼을 읽어 리스트로 반환 (중복 제거)"""
+# 기존 load_hrno_list_from_csv 함수는
+# 통신이 아닌 단순 파일 읽기이므로 그대로 유지합니다.
+def load_hrno_list_from_csv(
+        csv_path: Path,
+        col_name: str = "HRNO"
+) -> list[str]:
     hrnos = []
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-        if col_name not in reader.fieldnames:
-            raise ValueError(f"CSV에 '{col_name}' 컬럼이 없습니다. 발견된 컬럼: {reader.fieldnames}")
-
         for row in reader:
             v = (row.get(col_name) or "").strip()
             if v:
                 hrnos.append(v)
 
-    # 중복 제거(순서 유지)
     seen = set()
     uniq = []
     for x in hrnos:
-        if x in seen:
-            continue
-        seen.add(x)
-        uniq.append(x)
-
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
     return uniq
 
 
-def run(hrno_list: list[str], max_visit: int | None = None):
-    """HRNO 리스트를 돌면서 말 페이지 파싱 결과를 출력(지금 단계에서는 저장 X)"""
-    session = requests.Session()
-
-    if max_visit is not None:
-        hrno_list = hrno_list[:max_visit]
-
-    results = []
-
-    for idx, hrno in enumerate(hrno_list, start=1):
+# -------------------------------
+# 1. 단일 말 데이터 수집 코루틴 (세마포어 적용)
+# -------------------------------
+async def fetch_single_horse(
+        hrno: str,
+        idx: int,
+        total: int,
+        session: aiohttp.ClientSession,
+        sem: asyncio.Semaphore
+) -> dict | None:
+    # 톨게이트 진입: 동시에 최대 3개까지만 여기를 통과함
+    async with sem:
         url = build_horse_url(hrno)
 
         try:
-            data = parse_horse_page(url, session=session)
-            results.append(data)
-            print(f"[{idx}/{len(hrno_list)}] OK HRNO={hrno} -> {data}")
+            # 사람인 척 불규칙하게 대기 (지터 적용)
+            # 서버에 요청을 쏘기 직전에 쉬어줍니다.
+            delay = random.uniform(1.0, 2.0)
+            await asyncio.sleep(delay)
+
+            # 파서 역시 비동기 함수로 변경해야 하므로 await 사용
+            data = await parse_horse_page(
+                url,
+                hrno,
+                session=session
+            )
+
+            print(f"[{idx}/{total}] OK HRNO={hrno}")
+            return data
+
         except Exception as e:
-            print(f"[{idx}/{len(hrno_list)}] FAIL HRNO={hrno} / {e}")
+            print(f"[{idx}/{total}] FAIL HRNO={hrno} / {e}")
+            return None
 
-        time.sleep(random.uniform(1.0, 2.0))
 
-    return results
+# -------------------------------
+# 2. 메인 비동기 실행 루프
+# -------------------------------
+async def run_async(
+        hrno_list: list[str],
+        max_visit: int | None = None
+) -> list[dict]:
+    if max_visit is not None:
+        hrno_list = hrno_list[:max_visit]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://db.netkeiba.com/",
-}
+    total = len(hrno_list)
+    results = []
 
+    # 동시 접속 3개로 제한하는 톨게이트 생성
+    sem = asyncio.Semaphore(3)
+
+    # aiohttp 세션 생성 (requests.Session을 대체함)
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+
+        for idx, hrno in enumerate(hrno_list, start=1):
+            # 100마리의 작업 지시서를 일단 루프에 다 던져 넣음
+            task = asyncio.create_task(
+                fetch_single_horse(
+                    hrno, idx, total, session, sem
+                )
+            )
+            tasks.append(task)
+
+        # 던져진 작업들이 세마포어 규칙(3개씩)에 맞춰 실행됨
+        # gather는 모든 작업이 끝날 때까지 기다렸다가 결과를 모아줌
+        gathered_results = await asyncio.gather(*tasks)
+
+    # 에러가 나서 None이 반환된 경우를 제외하고 정상 데이터만 필터링
+    return [r for r in gathered_results if r is not None]
+
+
+# (save_results_to_csv 함수는 파일 저장 I/O이므로 기존 코드 그대로 사용)
 def save_results_to_csv(results: list[dict], out_path: Path):
-    """파싱 결과(list[dict])를 CSV로 저장"""
-
     if not results:
         print("[WARN] 저장할 데이터가 없습니다.")
         return
-
-    # 컬럼명 = dict key 기준
     fieldnames = list(results[0].keys())
-
     with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-
         writer.writeheader()
         writer.writerows(results)
-
     print(f"[OK] CSV 저장 완료: {out_path}")
 
-"""
-    HRNO 말 상세 정보 (출전이력 포함)
-"""
 
+# -------------------------------
+# 실행부 (Entry Point)
+# -------------------------------
 if __name__ == "__main__":
-    #✅ HRNOCrawler 폴더 기준으로 data/unique_hrno.csv 읽기
+    import sys  # sys.maxsize를 사용하기 위해 필요합니다.
+
     base_dir = Path(__file__).resolve().parent
     hrno_csv = base_dir / "data2" / "HRNO_kyoto.csv"
 
     if not hrno_csv.exists():
-        raise FileNotFoundError(f"HRNO CSV를 찾지 못했습니다: {hrno_csv}")
+        raise FileNotFoundError(f"CSV 없음: {hrno_csv}")
 
     hrnos = load_hrno_list_from_csv(hrno_csv, col_name="HRNO")
     print("HRNO 개수:", len(hrnos))
 
-    results = run(hrnos, max_visit=len(hrnos))
+    # ==========================================
+    # 1. 여기서 results 변수가 탄생합니다!
+    # ==========================================
+    results = asyncio.run(
+        run_async(hrnos, max_visit=len(hrnos))
+    )
 
-    # ===============================
-    # CSV 저장 경로 생성
-    # ===============================
-    input_name = hrno_csv.stem  # unique_hrno
-    output_name = f"{input_name}_result.csv"
+    # ==========================================
+    # 2. 순서 사전을 바탕으로 results 리스트 정렬
+    # ==========================================
+    order_map = {
+        hrno: i for i, hrno in enumerate(hrnos)
+    }
+
+    # x.get("HR_NO")를 써서 파싱 실패 시에도 안전하게 넘깁니다.
+    results.sort(
+        key=lambda x: order_map.get(
+            x.get("HR_NO"),
+            sys.maxsize
+        )
+    )
+
+    # ==========================================
+    # 3. CSV 파일로 저장
+    # ==========================================
+    input_name = hrno_csv.stem
+    output_name = f"{input_name}_result2.csv"
 
     out_csv = base_dir / "data2" / output_name
 
