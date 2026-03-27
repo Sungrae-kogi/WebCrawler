@@ -100,7 +100,7 @@ async def run_async(
             tasks.append(task)
 
         # 던져진 작업들이 세마포어 규칙(3개씩)에 맞춰 실행됨
-        # gather는 모든 작업이 끝날 때까지 기다렸다가 결과를 모아줌
+        # gather는 모든 작업이 끝날 때까지 기다렸다가 결과를 모아줌   -> Journaling 관련 문제점 : 모든 작업이 끝날때까지 RAM메모리에 쥐고 있다가, 모든 작업이 종료되고나서 이후에 save_results_to_csv()가 실행이 된다, 즉, 중간에 문제가 발생하면 csv저장을 못하고 다 날아감
         gathered_results = await asyncio.gather(*tasks)
 
     # 에러가 나서 None이 반환된 경우를 제외하고 정상 데이터만 필터링
