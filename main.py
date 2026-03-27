@@ -12,6 +12,20 @@ from pathlib import Path
 from parser import build_horse_url, parse_horse_page
 
 
+def get_completed_hrnos(out_path: Path) -> set[str]:
+    # 파일이 없으면 빈 세트(Set) 반환 (처음 실행하는 경우)
+    if not out_path.exists():
+        return set()
+
+    completed = set()
+    with open(out_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            val = row.get("HR_NO")
+            if val:
+                completed.add(val.strip())
+    return completed
+
 # 기존 load_hrno_list_from_csv 함수는
 # 통신이 아닌 단순 파일 읽기이므로 그대로 유지합니다.
 def load_hrno_list_from_csv(
@@ -43,8 +57,10 @@ async def fetch_single_horse(
         idx: int,
         total: int,
         session: aiohttp.ClientSession,
-        sem: asyncio.Semaphore
-) -> dict | None:
+        sem: asyncio.Semaphore,
+        lock: asyncio.Lock,
+        out_path: Path
+) -> None:
     # 톨게이트 진입: 동시에 최대 3개까지만 여기를 통과함
     async with sem:
         url = build_horse_url(hrno)
@@ -62,12 +78,24 @@ async def fetch_single_horse(
                 session=session
             )
 
+            #기존에는 서버에서 받아온 horse data를 반환.
+            # print(f"[{idx}/{total}] OK HRNO={hrno}")
+            # return data
+
+            # 여러 코루틴이 동시에 파일접근하는 것을 방지할 lock 시스템
+            async with lock:
+                file_exists = out_path.exists()
+                with open(out_path, "a", encoding="utf-8-sig", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=list(data.keys()))
+                    # 파일이 처음 만들어질때만 헤더 작성
+                    if not file_exists:
+                        writer.writeheader()
+                    writer.writerow(data)
             print(f"[{idx}/{total}] OK HRNO={hrno}")
-            return data
 
         except Exception as e:
             print(f"[{idx}/{total}] FAIL HRNO={hrno} / {e}")
-            return None
+
 
 
 # -------------------------------
@@ -75,36 +103,24 @@ async def fetch_single_horse(
 # -------------------------------
 async def run_async(
         hrno_list: list[str],
-        max_visit: int | None = None
-) -> list[dict]:
-    if max_visit is not None:
-        hrno_list = hrno_list[:max_visit]
-
+        out_path: Path  # 결과를 저장할 경로를 전달받음
+) -> None:
     total = len(hrno_list)
-    results = []
-
-    # 동시 접속 3개로 제한하는 톨게이트 생성
     sem = asyncio.Semaphore(3)
+    lock = asyncio.Lock()  # 파일 I/O 자물쇠 생성
 
-    # aiohttp 세션 생성 (requests.Session을 대체함)
     async with aiohttp.ClientSession() as session:
         tasks = []
-
         for idx, hrno in enumerate(hrno_list, start=1):
-            # 100마리의 작업 지시서를 일단 루프에 다 던져 넣음
             task = asyncio.create_task(
                 fetch_single_horse(
-                    hrno, idx, total, session, sem
+                    hrno, idx, total, session, sem, lock, out_path
                 )
             )
             tasks.append(task)
 
-        # 던져진 작업들이 세마포어 규칙(3개씩)에 맞춰 실행됨
-        # gather는 모든 작업이 끝날 때까지 기다렸다가 결과를 모아줌   -> Journaling 관련 문제점 : 모든 작업이 끝날때까지 RAM메모리에 쥐고 있다가, 모든 작업이 종료되고나서 이후에 save_results_to_csv()가 실행이 된다, 즉, 중간에 문제가 발생하면 csv저장을 못하고 다 날아감
-        gathered_results = await asyncio.gather(*tasks)
-
-    # 에러가 나서 None이 반환된 경우를 제외하고 정상 데이터만 필터링
-    return [r for r in gathered_results if r is not None]
+        # 던져진 모든 작업이 끝날 때까지 대기
+        await asyncio.gather(*tasks)
 
 
 # (save_results_to_csv 함수는 파일 저장 I/O이므로 기존 코드 그대로 사용)
@@ -124,45 +140,31 @@ def save_results_to_csv(results: list[dict], out_path: Path):
 # 실행부 (Entry Point)
 # -------------------------------
 if __name__ == "__main__":
-    import sys  # sys.maxsize를 사용하기 위해 필요합니다.
-
     base_dir = Path(__file__).resolve().parent
     hrno_csv = base_dir / "data2" / "HRNO_kyoto.csv"
+
+    input_name = hrno_csv.stem
+    out_csv = base_dir / "data2" / f"{input_name}_result2.csv"
 
     if not hrno_csv.exists():
         raise FileNotFoundError(f"CSV 없음: {hrno_csv}")
 
-    hrnos = load_hrno_list_from_csv(hrno_csv, col_name="HRNO")
-    print("HRNO 개수:", len(hrnos))
+    # 1. 전체 크롤링 대상 명단 가져오기
+    all_hrnos = load_hrno_list_from_csv(hrno_csv, col_name="HRNO")
 
-    # ==========================================
-    # 1. 여기서 results 변수가 탄생합니다!
-    # ==========================================
-    results = asyncio.run(
-        run_async(hrnos, max_visit=len(hrnos))
-    )
+    # 2. 이미 수집 완료된 명단(저널) 확인하기
+    completed_set = get_completed_hrnos(out_csv)
 
-    # ==========================================
-    # 2. 순서 사전을 바탕으로 results 리스트 정렬
-    # ==========================================
-    order_map = {
-        hrno: i for i, hrno in enumerate(hrnos)
-    }
+    # 3. 전체 명단에서 완료된 명단을 빼서 '남은 작업'만 추려내기
+    target_hrnos = [h for h in all_hrnos if h not in completed_set]
 
-    # x.get("HR_NO")를 써서 파싱 실패 시에도 안전하게 넘깁니다.
-    results.sort(
-        key=lambda x: order_map.get(
-            x.get("HR_NO"),
-            sys.maxsize
-        )
-    )
+    print(f"전체 명단: {len(all_hrnos)} 건")
+    print(f"이미 완료: {len(completed_set)} 건")
+    print(f"진행 대상: {len(target_hrnos)} 건")
 
-    # ==========================================
-    # 3. CSV 파일로 저장
-    # ==========================================
-    input_name = hrno_csv.stem
-    output_name = f"{input_name}_result2.csv"
-
-    out_csv = base_dir / "data2" / output_name
-
-    save_results_to_csv(results, out_csv)
+    if not target_hrnos:
+        print("🎉 모든 크롤링이 이미 완료되었습니다!")
+    else:
+        # 4. 남은 작업에 대해서만 비동기 크롤링 실행
+        asyncio.run(run_async(target_hrnos, out_csv))
+        print(f"🎉 크롤링 종료! 결과 파일: {out_csv}")

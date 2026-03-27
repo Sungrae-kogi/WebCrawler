@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 
 # ==========================================
-# 1. 상수 (Constants) 정의
+# 1. 상수 및 헬퍼 함수 (기존과 동일하게 유지)
 # ==========================================
 HEADERS = {
     "User-Agent": (
@@ -21,13 +21,8 @@ BASE_HORSE_URL = "https://db.netkeiba.com/horse/"
 PED_AJAX_URL = "https://db.netkeiba.com/horse/ajax_horse_pedigree.html"
 RESULTS_AJAX_URL = "https://db.netkeiba.com/horse/ajax_horse_results.html"
 
-
-# ==========================================
-# 2. 내부 헬퍼 함수들 (동기식 그대로 사용)
-# ==========================================
 def build_horse_url(hrno: str) -> str:
     return f"{BASE_HORSE_URL}{str(hrno).strip()}/"
-
 
 def _clean_td_value(td) -> str | None:
     if td is None: return None
@@ -36,12 +31,10 @@ def _clean_td_value(td) -> str | None:
     if v == "-": return "-"
     return v
 
-
 def _extract_no(pattern: str, text: str) -> str | None:
     if not text: return None
     m = re.search(pattern, text)
     return m.group(1) if m else None
-
 
 def _extract_html_from_ajax_json(data: dict) -> str | None:
     if not isinstance(data, dict): return None
@@ -51,81 +44,55 @@ def _extract_html_from_ajax_json(data: dict) -> str | None:
             return v
     return None
 
-
 def _parse_jp_money(text: str | None) -> str | None:
     if not text: return None
     t = text.strip()
     if t == "-": return "-"
-
     t = t.replace(",", "").replace(" ", "")
     oku_val = 0
     man_val = 0
-
     m_oku = re.search(r"(\d+)億", t)
     if m_oku: oku_val = int(m_oku.group(1))
-
-    if "億" in t:
-        m_man = re.search(r"億(\d+)万", t)
-    else:
-        m_man = re.search(r"(\d+)万", t)
-
+    if "億" in t: m_man = re.search(r"億(\d+)万", t)
+    else: m_man = re.search(r"(\d+)万", t)
     if m_man: man_val = int(m_man.group(1))
-
     if oku_val > 0 and man_val == 0 and "万" not in t: pass
     if oku_val == 0 and man_val == 0 and "万" not in t and "億" not in t:
         m_pure = re.search(r"(\d+)", t)
         if m_pure: return m_pure.group(1)
-
     total_man = (oku_val * 10000) + man_val
     return str(total_man)
-
 
 def _parse_jp_date(date_text: str) -> datetime | None:
     if not date_text: return None
     t = date_text.strip()
-    try:
-        return datetime.strptime(t, "%Y/%m/%d")
-    except Exception:
-        pass
-
-    try:
-        return datetime.strptime(t, "%Y.%m.%d")
-    except Exception:
-        pass
-
+    try: return datetime.strptime(t, "%Y/%m/%d")
+    except Exception: pass
+    try: return datetime.strptime(t, "%Y.%m.%d")
+    except Exception: pass
     m = re.match(r"^\s*(\d{4})\D+(\d{1,2})\D+(\d{1,2})\s*$", t)
     if m:
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        try:
-            return datetime(y, mo, d)
-        except Exception:
-            return None
+        try: return datetime(y, mo, d)
+        except Exception: return None
     return None
-
 
 def _parse_prize_to_int(text: str | None) -> int:
     if not text: return 0
     t = text.strip()
     if t == "-" or t == "": return 0
     t = t.replace(",", "")
-
     m_man = re.search(r"(\d+(?:\.\d+)?)\s*万", t)
     if m_man:
-        try:
-            return int(float(m_man.group(1)) * 10000)
-        except Exception:
-            return 0
-
+        try: return int(float(m_man.group(1)) * 10000)
+        except Exception: return 0
     m = re.search(r"(\d+)", t)
     if not m: return 0
-    try:
-        return int(m.group(1))
-    except Exception:
-        return 0
-
+    try: return int(m.group(1))
+    except Exception: return 0
 
 # ==========================================
-# 3. 비동기 통신 함수들 (AJAX 파싱)
+# 2. 비동기 통신 함수들 (AJAX) - 인코딩 및 파라미터 적용
 # ==========================================
 async def fetch_pedigree_fa_mo(
         hr_no: str,
@@ -145,11 +112,7 @@ async def fetch_pedigree_fa_mo(
                 headers=HEADERS,
                 timeout=20
         ) as res:
-
-            raw_text = await res.text(
-                encoding="euc-jp",
-                errors="replace"
-            )
+            raw_text = await res.text(encoding="euc-jp", errors="replace")
             data = json.loads(raw_text)
     except Exception as e:
         print(f"[WARN] 혈통 AJAX 에러 HRNO={hr_no} / {e}")
@@ -173,10 +136,8 @@ async def fetch_pedigree_fa_mo(
         ped_no = _extract_no(r"/ped/([^/]+)/?", href)
         ped_name = a.get("title") or a.get_text(" ", strip=True)
         rowspan_raw = td.get("rowspan")
-        try:
-            rowspan = int(rowspan_raw) if rowspan_raw else 1
-        except ValueError:
-            rowspan = 1
+        try: rowspan = int(rowspan_raw) if rowspan_raw else 1
+        except ValueError: rowspan = 1
         mo_candidates.append((rowspan, ped_name, ped_no))
 
     if mo_candidates:
@@ -186,7 +147,6 @@ async def fetch_pedigree_fa_mo(
         result["MO_HR_NO"] = mo_no
 
     return result
-
 
 async def fetch_results_counts(
         hr_no: str,
@@ -207,11 +167,7 @@ async def fetch_results_counts(
                 headers=HEADERS,
                 timeout=20
         ) as res:
-
-            raw_text = await res.text(
-                encoding="euc-jp",
-                errors="replace"
-            )
+            raw_text = await res.text(encoding="euc-jp", errors="replace")
             data = json.loads(raw_text)
     except Exception as e:
         print(f"[WARN] 성적 AJAX 에러 HRNO={hr_no} / {e}")
@@ -263,12 +219,9 @@ async def fetch_results_counts(
             m = re.match(r"^(\d+)", finish_text)
             if m:
                 fin = int(m.group(1))
-                if fin == 1:
-                    result["ORD1_CNTT"] += 1
-                elif fin == 2:
-                    result["ORD2_CNTT"] += 1
-                elif fin == 3:
-                    result["ORD3_CNTT"] += 1
+                if fin == 1: result["ORD1_CNTT"] += 1
+                elif fin == 2: result["ORD2_CNTT"] += 1
+                elif fin == 3: result["ORD3_CNTT"] += 1
 
         if DATE_COL_IDX is None or len(tds) <= DATE_COL_IDX: continue
 
@@ -283,27 +236,25 @@ async def fetch_results_counts(
                 m = re.match(r"^(\d+)", finish_text)
                 if m:
                     fin = int(m.group(1))
-                    if fin == 1:
-                        result["ORD1_CNTY"] += 1
-                    elif fin == 2:
-                        result["ORD2_CNTY"] += 1
-                    elif fin == 3:
-                        result["ORD3_CNTY"] += 1
+                    if fin == 1: result["ORD1_CNTY"] += 1
+                    elif fin == 2: result["ORD2_CNTY"] += 1
+                    elif fin == 3: result["ORD3_CNTY"] += 1
 
             if PRIZE_COL_IDX is not None and len(tds) > PRIZE_COL_IDX:
                 prize_text = tds[PRIZE_COL_IDX].get_text(" ", strip=True)
+                # 에러 방지: _parse_prize_to_int 함수 사용
                 result["CHAKSUNY"] += _parse_prize_to_int(prize_text)
 
         if dt >= cutoff_6m:
             if PRIZE_COL_IDX is not None and len(tds) > PRIZE_COL_IDX:
                 prize_text = tds[PRIZE_COL_IDX].get_text(" ", strip=True)
+                # 에러 방지: _parse_prize_to_int 함수 사용
                 result["CHAKSUN_6M"] += _parse_prize_to_int(prize_text)
 
     return result
 
-
 # ==========================================
-# 4. 메인 파서 함수 (비동기)
+# 3. 메인 파서 함수
 # ==========================================
 async def parse_horse_page(
         url: str,
@@ -323,12 +274,8 @@ async def parse_horse_page(
         "CHAKSUNY": None, "CHAKSUN_6M": None,
     }
 
-# 인코딩 지정 및 에러 무시
     async with session.get(url, headers=HEADERS, timeout=20) as res:
-        html = await res.text(
-            encoding="euc-jp",
-            errors="replace"
-        )
+        html = await res.text(encoding="euc-jp", errors="replace")
 
     soup = BeautifulSoup(html, "lxml")
 
@@ -344,10 +291,7 @@ async def parse_horse_page(
             out["SEX"] = m2.group(1)
             out["AGE"] = m2.group(2)
 
-    prof_area = soup.select_one("div.db_prof_area_02")
-    if prof_area is None:
-        prof_area = soup.select_one("div.db_prof")
-
+    prof_area = soup.select_one("div.db_prof_area_02") or soup.select_one("div.db_prof")
     if prof_area:
         prof_table = prof_area.find("table")
         if prof_table:
@@ -366,16 +310,14 @@ async def parse_horse_page(
                     a = td.find("a")
                     if a:
                         out["TR_NAME"] = a.get("title") or _clean_td_value(a)
-                        href = a.get("href", "")
-                        out["TR_NO"] = _extract_no(r"/trainer/([^/]+)/?", href)
+                        out["TR_NO"] = _extract_no(r"/trainer/([^/]+)/?", a.get("href", ""))
                     else:
                         out["TR_NAME"] = td_text
                 elif "馬主" in key:
                     a = td.find("a")
                     if a:
                         out["OW_NAME"] = a.get("title") or _clean_td_value(a)
-                        href = a.get("href", "")
-                        out["OW_NO"] = _extract_no(r"/owner/([^/]+)/?", href)
+                        out["OW_NO"] = _extract_no(r"/owner/([^/]+)/?", a.get("href", ""))
                     else:
                         out["OW_NAME"] = td_text
                 elif "産地" in key:
@@ -395,13 +337,10 @@ async def parse_horse_page(
                 elif "セリ取引価格" in key:
                     out["HR_LAST_AMT"] = _parse_jp_money(td_text)
 
-    # 비동기로 혈통과 성적을 동시에 병렬 수집
-    # asyncio.gather는 여러 개의 비동기 작업(코루틴)을 동시에(병렬로) 실행하고, 그 결과들을 하나의 리스트로 모아주는 도구입니다.
-
-
+    # 비동기로 병렬 수집
     ped_task = fetch_pedigree_fa_mo(hr_no, session)
     counts_task = fetch_results_counts(hr_no, session)
-    ped, counts = await asyncio.gather(ped_task, counts_task)                   # asyncio.gather() 로 AJAX 요청 두개를 묶어서 처리.
+    ped, counts = await asyncio.gather(ped_task, counts_task)
 
     out["FA_HR_NAME"] = ped["FA_HR_NAME"]
     out["FA_HR_NO"] = ped["FA_HR_NO"]
